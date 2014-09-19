@@ -70,7 +70,7 @@ func NewWatcher() (*Watcher, error) {
 		paths:   make(map[int]string),
 		Event:   make(chan *Event),
 		Error:   make(chan error),
-		done:    make(chan bool, 1),
+		done:    make(chan bool),
 	}
 
 	go w.readEvents()
@@ -87,10 +87,11 @@ func (w *Watcher) Close() error {
 	w.isClosed = true
 
 	// Send "quit" message to the reader goroutine
-	w.done <- true
 	for path := range w.watches {
 		w.RemoveWatch(path)
 	}
+
+	w.done <- true
 
 	return nil
 }
@@ -152,66 +153,73 @@ func (w *Watcher) RemoveWatch(path string) error {
 func (w *Watcher) readEvents() {
 	var buf [syscall.SizeofInotifyEvent * 4096]byte
 
-	for {
-		n, err := syscall.Read(w.fd, buf[:])
-		// See if there is a message on the "done" channel
+	stop := make(chan bool)
+	go func() {
 		var done bool
-		select {
-		case done = <-w.done:
-		default:
-		}
 
-		// If EOF or a "done" message is received
-		if n == 0 || done {
-			// The syscall.Close can be slow.  Close
-			// w.Event first.
-			close(w.Event)
-			err := syscall.Close(w.fd)
-			if err != nil {
-				w.Error <- os.NewSyscallError("close", err)
+		for !done {
+			go func() {
+				done = <-w.done
+			}()
+
+			for !done {
+				n, err := syscall.Read(w.fd, buf[:])
+				// If EOF
+				if n == 0 {
+					w.done <- true
+					return
+				}
+				if n < 0 {
+					w.Error <- os.NewSyscallError("read", err)
+					continue
+				}
+				if n < syscall.SizeofInotifyEvent {
+					w.Error <- errors.New("inotify: short read in readEvents()")
+					continue
+				}
+
+				var offset uint32 = 0
+				// We don't know how many events we just read into the buffer
+				// While the offset points to at least one whole event...
+				for offset <= uint32(n-syscall.SizeofInotifyEvent) && !done {
+					// Point "raw" to the event in the buffer
+					raw := (*syscall.InotifyEvent)(unsafe.Pointer(&buf[offset]))
+					event := new(Event)
+					event.Mask = uint32(raw.Mask)
+					event.Cookie = uint32(raw.Cookie)
+					nameLen := uint32(raw.Len)
+					// If the event happened to the watched directory or the watched file, the kernel
+					// doesn't append the filename to the event, but we would like to always fill the
+					// the "Name" field with a valid filename. We retrieve the path of the watch from
+					// the "paths" map.
+					w.mu.Lock()
+					event.Name = w.paths[int(raw.Wd)]
+					w.mu.Unlock()
+					if nameLen > 0 {
+						// Point "bytes" at the first byte of the filename
+						bytes := (*[syscall.PathMax]byte)(unsafe.Pointer(&buf[offset+syscall.SizeofInotifyEvent]))
+						// The filename is padded with NUL bytes. TrimRight() gets rid of those.
+						event.Name += "/" + strings.TrimRight(string(bytes[0:nameLen]), "\000")
+					}
+					// Send the event on the events channel
+					w.Event <- event
+
+					// Move to the next event in the buffer
+					offset += syscall.SizeofInotifyEvent + nameLen
+				}
 			}
-			close(w.Error)
-			return
 		}
-		if n < 0 {
-			w.Error <- os.NewSyscallError("read", err)
-			continue
-		}
-		if n < syscall.SizeofInotifyEvent {
-			w.Error <- errors.New("inotify: short read in readEvents()")
-			continue
-		}
+	}()
 
-		var offset uint32 = 0
-		// We don't know how many events we just read into the buffer
-		// While the offset points to at least one whole event...
-		for offset <= uint32(n-syscall.SizeofInotifyEvent) {
-			// Point "raw" to the event in the buffer
-			raw := (*syscall.InotifyEvent)(unsafe.Pointer(&buf[offset]))
-			event := new(Event)
-			event.Mask = uint32(raw.Mask)
-			event.Cookie = uint32(raw.Cookie)
-			nameLen := uint32(raw.Len)
-			// If the event happened to the watched directory or the watched file, the kernel
-			// doesn't append the filename to the event, but we would like to always fill the
-			// the "Name" field with a valid filename. We retrieve the path of the watch from
-			// the "paths" map.
-			w.mu.Lock()
-			event.Name = w.paths[int(raw.Wd)]
-			w.mu.Unlock()
-			if nameLen > 0 {
-				// Point "bytes" at the first byte of the filename
-				bytes := (*[syscall.PathMax]byte)(unsafe.Pointer(&buf[offset+syscall.SizeofInotifyEvent]))
-				// The filename is padded with NUL bytes. TrimRight() gets rid of those.
-				event.Name += "/" + strings.TrimRight(string(bytes[0:nameLen]), "\000")
-			}
-			// Send the event on the events channel
-			w.Event <- event
-
-			// Move to the next event in the buffer
-			offset += syscall.SizeofInotifyEvent + nameLen
-		}
+	<-stop
+	// The syscall.Close can be slow.  Close
+	// w.Event first.
+	close(w.Event)
+	err := syscall.Close(w.fd)
+	if err != nil {
+		w.Error <- os.NewSyscallError("close", err)
 	}
+	close(w.Error)
 }
 
 // String formats the event e in the form
