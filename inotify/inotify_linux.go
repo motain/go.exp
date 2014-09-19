@@ -157,56 +157,55 @@ func (w *Watcher) readEvents() {
 	go func() {
 		var done bool
 
-		for !done {
-			go func() {
-				done = <-w.done
-			}()
+		for {
+			select {
+			case done = <-w.done:
+			default:
+			}
 
-			for !done {
-				n, err := syscall.Read(w.fd, buf[:])
-				// If EOF
-				if n == 0 {
-					w.done <- true
-					return
-				}
-				if n < 0 {
-					w.Error <- os.NewSyscallError("read", err)
-					continue
-				}
-				if n < syscall.SizeofInotifyEvent {
-					w.Error <- errors.New("inotify: short read in readEvents()")
-					continue
-				}
+			n, err := syscall.Read(w.fd, buf[:])
+			// If EOF
+			if n == 0 || done {
+				stop <- true
+				return
+			}
+			if n < 0 {
+				w.Error <- os.NewSyscallError("read", err)
+				continue
+			}
+			if n < syscall.SizeofInotifyEvent {
+				w.Error <- errors.New("inotify: short read in readEvents()")
+				continue
+			}
 
-				var offset uint32 = 0
-				// We don't know how many events we just read into the buffer
-				// While the offset points to at least one whole event...
-				for offset <= uint32(n-syscall.SizeofInotifyEvent) && !done {
-					// Point "raw" to the event in the buffer
-					raw := (*syscall.InotifyEvent)(unsafe.Pointer(&buf[offset]))
-					event := new(Event)
-					event.Mask = uint32(raw.Mask)
-					event.Cookie = uint32(raw.Cookie)
-					nameLen := uint32(raw.Len)
-					// If the event happened to the watched directory or the watched file, the kernel
-					// doesn't append the filename to the event, but we would like to always fill the
-					// the "Name" field with a valid filename. We retrieve the path of the watch from
-					// the "paths" map.
-					w.mu.Lock()
-					event.Name = w.paths[int(raw.Wd)]
-					w.mu.Unlock()
-					if nameLen > 0 {
-						// Point "bytes" at the first byte of the filename
-						bytes := (*[syscall.PathMax]byte)(unsafe.Pointer(&buf[offset+syscall.SizeofInotifyEvent]))
-						// The filename is padded with NUL bytes. TrimRight() gets rid of those.
-						event.Name += "/" + strings.TrimRight(string(bytes[0:nameLen]), "\000")
-					}
-					// Send the event on the events channel
-					w.Event <- event
-
-					// Move to the next event in the buffer
-					offset += syscall.SizeofInotifyEvent + nameLen
+			var offset uint32 = 0
+			// We don't know how many events we just read into the buffer
+			// While the offset points to at least one whole event...
+			for offset <= uint32(n-syscall.SizeofInotifyEvent) {
+				// Point "raw" to the event in the buffer
+				raw := (*syscall.InotifyEvent)(unsafe.Pointer(&buf[offset]))
+				event := new(Event)
+				event.Mask = uint32(raw.Mask)
+				event.Cookie = uint32(raw.Cookie)
+				nameLen := uint32(raw.Len)
+				// If the event happened to the watched directory or the watched file, the kernel
+				// doesn't append the filename to the event, but we would like to always fill the
+				// the "Name" field with a valid filename. We retrieve the path of the watch from
+				// the "paths" map.
+				w.mu.Lock()
+				event.Name = w.paths[int(raw.Wd)]
+				w.mu.Unlock()
+				if nameLen > 0 {
+					// Point "bytes" at the first byte of the filename
+					bytes := (*[syscall.PathMax]byte)(unsafe.Pointer(&buf[offset+syscall.SizeofInotifyEvent]))
+					// The filename is padded with NUL bytes. TrimRight() gets rid of those.
+					event.Name += "/" + strings.TrimRight(string(bytes[0:nameLen]), "\000")
 				}
+				// Send the event on the events channel
+				w.Event <- event
+
+				// Move to the next event in the buffer
+				offset += syscall.SizeofInotifyEvent + nameLen
 			}
 		}
 	}()
